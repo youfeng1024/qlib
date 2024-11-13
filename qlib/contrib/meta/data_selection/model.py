@@ -10,7 +10,6 @@ from tqdm.auto import tqdm
 import copy
 from typing import Union, List
 
-from ....data.dataset import TSDataSampler
 from ....model.meta.dataset import MetaTaskDataset
 from ....model.meta.model import MetaTaskModel
 from ....workflow import R
@@ -29,12 +28,9 @@ class TimeReweighter(Reweighter):
     def __init__(self, time_weight: pd.Series):
         self.time_weight = time_weight
 
-    def reweight(self, data: Union[pd.DataFrame, pd.Series, TSDataSampler]):
-        if isinstance(data, TSDataSampler):
-            # TODO: handling TSDataSampler
-            w_s = pd.Series(1.0, index=data.data_index[data.start_idx:])
-        else:
-            w_s = pd.Series(1.0, index=data.index)
+    def reweight(self, data: Union[pd.DataFrame, pd.Series]):
+        # TODO: handling TSDataSampler
+        w_s = pd.Series(1.0, index=data.index)
         for k, w in self.time_weight.items():
             w_s.loc[slice(*k)] = w
         logger.info(f"Reweighting result: {w_s}")
@@ -57,7 +53,12 @@ class MetaModelDS(MetaTaskModel):
         max_epoch=100,
         seed=43,
         alpha=0.0,
+        loss_skip_thresh=50,
     ):
+        """
+        loss_skip_size: int
+            The number of threshold to skip the loss calculation for each day.
+        """
         self.step = step
         self.hist_step_n = hist_step_n
         self.clip_method = clip_method
@@ -67,6 +68,7 @@ class MetaModelDS(MetaTaskModel):
         self.max_epoch = max_epoch
         self.fitted = False
         self.alpha = alpha
+        self.loss_skip_thresh = loss_skip_thresh
         torch.manual_seed(seed)
 
     def run_epoch(self, phase, task_list, epoch, opt, loss_l, ignore_weight=False):
@@ -92,12 +94,14 @@ class MetaModelDS(MetaTaskModel):
                 criterion = nn.MSELoss()
                 loss = criterion(pred, meta_input["y_test"])
             elif self.criterion == "ic_loss":
-                criterion = ICLoss()
+                criterion = ICLoss(self.loss_skip_thresh)
                 try:
-                    loss = criterion(pred, meta_input["y_test"], meta_input["test_idx"], skip_size=50)
+                    loss = criterion(pred, meta_input["y_test"], meta_input["test_idx"])
                 except ValueError as e:
                     get_module_logger("MetaModelDS").warning(f"Exception `{e}` when calculating IC loss")
                     continue
+            else:
+                raise ValueError(f"Unknown criterion: {self.criterion}")
 
             assert not np.isnan(loss.detach().item()), "NaN loss!"
 
@@ -121,12 +125,10 @@ class MetaModelDS(MetaTaskModel):
         loss_l.setdefault(phase, []).append(running_loss)
 
         pred_y_all = pd.concat(pred_y_all)
-        ic = pred_y_all.groupby("datetime").apply(lambda df: df["pred"].corr(df["label"], method="pearson")).mean()
+        ic = pred_y_all.groupby("datetime").apply(lambda df: df["pred"].corr(df["label"], method="spearman")).mean()
 
         R.log_metrics(**{f"loss/{phase}": running_loss, "step": epoch})
         R.log_metrics(**{f"ic/{phase}": ic, "step": epoch})
-        print(ic)
-        return pred_y_all
 
     def fit(self, meta_dataset: MetaDatasetDS):
         """

@@ -1,30 +1,25 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-
 from __future__ import division
 from __future__ import print_function
+import copy
+from typing import Text, Union
 
 import numpy as np
 import pandas as pd
-from typing import Text, Union
-import copy
-
-from torch.nn import Linear
-
-from qlib.data.dataset.weight import Reweighter
-
-from ...utils import get_or_create_path
-from ...log import get_module_logger
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from .pytorch_utils import count_parameters
-from ...model.base import Model
+from qlib.workflow import R
+
 from ...data.dataset import DatasetH
 from ...data.dataset.handler import DataHandlerLP
+from ...log import get_module_logger
+from ...model.base import Model
+from ...utils import get_or_create_path
+from .pytorch_utils import count_parameters
 
 
 class GRU(Model):
@@ -52,7 +47,7 @@ class GRU(Model):
         lr=0.001,
         metric="",
         batch_size=2000,
-        early_stop=8,
+        early_stop=20,
         loss="mse",
         optimizer="adam",
         GPU=0,
@@ -138,38 +133,27 @@ class GRU(Model):
     def use_gpu(self):
         return self.device != torch.device("cpu")
 
-    def mse(self, pred, label, weight):
+    def mse(self, pred, label):
         loss = (pred - label) ** 2
-        if weight is None:
-            return torch.mean(loss)
-        else:
-            return torch.mean(loss * weight)
+        return torch.mean(loss)
 
-    def loss_fn(self, pred, label, weight=None):
-        # mask = ~torch.isnan(label)
-        # pred = pred[mask]
-        # label = label[mask]
-        # if weight is None:
-        #     weight = torch.ones_like(label)
+    def loss_fn(self, pred, label):
+        mask = ~torch.isnan(label)
+
         if self.loss == "mse":
-            return self.mse(pred, label, weight)
-        elif self.loss == 'ic':
-            return -torch.dot(
-                (pred - pred.mean()) / np.sqrt(pred.shape[0]) / pred.std(),
-                (label - label.mean()) / np.sqrt(label.shape[0]) / label.std(),
-            )
+            return self.mse(pred[mask], label[mask])
 
         raise ValueError("unknown loss `%s`" % self.loss)
 
     def metric_fn(self, pred, label):
-        # mask = torch.isfinite(label)
+        mask = torch.isfinite(label)
 
         if self.metric in ("", "loss"):
-            return -self.loss_fn(pred, label)
+            return -self.loss_fn(pred[mask], label[mask])
 
         raise ValueError("unknown metric `%s`" % self.metric)
 
-    def train_epoch(self, x_train, y_train, w_train):
+    def train_epoch(self, x_train, y_train):
         x_train_values = x_train.values
         y_train_values = np.squeeze(y_train.values)
 
@@ -184,17 +168,13 @@ class GRU(Model):
 
             feature = torch.from_numpy(x_train_values[indices[i : i + self.batch_size]]).float().to(self.device)
             label = torch.from_numpy(y_train_values[indices[i : i + self.batch_size]]).float().to(self.device)
-            if w_train is None:
-                weight = None
-            else:
-                weight = torch.from_numpy(w_train[indices[i: i + self.batch_size]]).float().to(self.device)
 
             pred = self.gru_model(feature)
-            loss = self.loss_fn(pred, label, weight)
+            loss = self.loss_fn(pred, label)
 
             self.train_optimizer.zero_grad()
             loss.backward()
-            # torch.nn.utils.clip_grad_value_(self.gru_model.parameters(), 3.0)
+            torch.nn.utils.clip_grad_value_(self.gru_model.parameters(), 3.0)
             self.train_optimizer.step()
 
     def test_epoch(self, data_x, data_y):
@@ -218,42 +198,45 @@ class GRU(Model):
 
             with torch.no_grad():
                 pred = self.gru_model(feature)
-                # loss = self.loss_fn(pred, label)
-                # losses.append(loss.item())
+                loss = self.loss_fn(pred, label)
+                losses.append(loss.item())
 
                 score = self.metric_fn(pred, label)
                 scores.append(score.item())
 
-        return np.mean(scores)
+        return np.mean(losses), np.mean(scores)
 
     def fit(
         self,
         dataset: DatasetH,
         evals_result=dict(),
         save_path=None,
-        reweighter=None,
     ):
-        df_train, df_valid, df_test = dataset.prepare(
-            ["train", "valid", "test"],
-            col_set=["feature", "label"],
-            data_key=DataHandlerLP.DK_L,
-        )
-        if df_train.empty or df_valid.empty:
-            raise ValueError("Empty data from dataset, please check your dataset config.")
+        # prepare training and validation data
+        dfs = {
+            k: dataset.prepare(
+                k,
+                col_set=["feature", "label"],
+                data_key=DataHandlerLP.DK_L,
+            )
+            for k in ["train", "valid"]
+            if k in dataset.segments
+        }
+        df_train, df_valid = dfs.get("train", pd.DataFrame()), dfs.get("valid", pd.DataFrame())
 
-        if reweighter is None:
-            wl_train = None
-            # wl_valid = None
-            # wl_train = np.ones(len(df_train))
-            # wl_valid = np.ones(len(df_valid))
-        elif isinstance(reweighter, Reweighter):
-            wl_train = reweighter.reweight(df_train).values
-            # wl_valid = reweighter.reweight(df_valid).values
-        else:
-            raise ValueError("Unsupported reweighter type.")
+        # check if training data is empty
+        if df_train.empty:
+            raise ValueError("Empty training data from dataset, please check your dataset config.")
 
+        df_train = df_train.dropna()
         x_train, y_train = df_train["feature"], df_train["label"]
-        x_valid, y_valid = df_valid["feature"], df_valid["label"]
+
+        # check if validation data is provided
+        if not df_valid.empty:
+            df_valid = df_valid.dropna()
+            x_valid, y_valid = df_valid["feature"], df_valid["label"]
+        else:
+            x_valid, y_valid = None, None
 
         save_path = get_or_create_path(save_path)
         stop_steps = 0
@@ -267,31 +250,41 @@ class GRU(Model):
         self.logger.info("training...")
         self.fitted = True
 
+        best_param = copy.deepcopy(self.gru_model.state_dict())
         for step in range(self.n_epochs):
             self.logger.info("Epoch%d:", step)
             self.logger.info("training...")
-            self.train_epoch(x_train, y_train, wl_train)
+            self.train_epoch(x_train, y_train)
             self.logger.info("evaluating...")
-            # train_loss, train_score = self.test_epoch(x_train, y_train)
-            val_score = self.test_epoch(x_valid, y_valid)
-            self.logger.info("valid %.6f" % (val_score))
-            # evals_result["train"].append(train_score)
-            evals_result["valid"].append(val_score)
+            train_loss, train_score = self.test_epoch(x_train, y_train)
+            evals_result["train"].append(train_score)
 
-            if val_score > best_score:
-                best_score = val_score
-                stop_steps = 0
-                best_epoch = step
-                best_param = copy.deepcopy(self.gru_model.state_dict())
-            else:
-                stop_steps += 1
-                if stop_steps >= self.early_stop:
-                    self.logger.info("early stop")
-                    break
+            # evaluate on validation data if provided
+            if x_valid is not None and y_valid is not None:
+                val_loss, val_score = self.test_epoch(x_valid, y_valid)
+                self.logger.info("train %.6f, valid %.6f" % (train_score, val_score))
+                evals_result["valid"].append(val_score)
+
+                if val_score > best_score:
+                    best_score = val_score
+                    stop_steps = 0
+                    best_epoch = step
+                    best_param = copy.deepcopy(self.gru_model.state_dict())
+                else:
+                    stop_steps += 1
+                    if stop_steps >= self.early_stop:
+                        self.logger.info("early stop")
+                        break
 
         self.logger.info("best score: %.6lf @ %d" % (best_score, best_epoch))
         self.gru_model.load_state_dict(best_param)
         torch.save(best_param, save_path)
+
+        # Logging
+        rec = R.get_recorder()
+        for k, v_l in evals_result.items():
+            for i, v in enumerate(v_l):
+                rec.log_metrics(step=i, **{k: v})
 
         if self.use_gpu:
             torch.cuda.empty_cache()
@@ -324,8 +317,6 @@ class GRU(Model):
 
 
 class GRUModel(nn.Module):
-    fc_out: Linear
-
     def __init__(self, d_feat=6, hidden_size=64, num_layers=2, dropout=0.0):
         super().__init__()
 
